@@ -47,6 +47,38 @@ users_ws = None
 messages_ws = None
 
 
+def _parse_service_account_env(raw: str):
+    """Parse SERVICE_ACCOUNT_JSON robustly.
+    - Strips surrounding single quotes if present (common in .env).
+    - Attempts JSON parse; if fails, tries a double-decoding fallback.
+    Returns dict on success; raises on failure.
+    """
+    if raw is None:
+        raise ValueError("Missing SERVICE_ACCOUNT_JSON env")
+    s = raw.strip()
+    # Strip wrapping single quotes often used in .env files
+    if s.startswith("'") and s.endswith("'"):
+        s = s[1:-1]
+    # First attempt: direct JSON
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # Some environments double-encode the JSON string
+    try:
+        inner = json.loads(s)
+        if isinstance(inner, str):
+            return json.loads(inner)
+    except Exception:
+        pass
+    # As a last resort, replace escaped newlines in private key then parse
+    try:
+        s2 = s.replace('\\n', '\n')
+        return json.loads(s2)
+    except Exception as e:
+        raise ValueError(f"Could not parse SERVICE_ACCOUNT_JSON: {e}")
+
+
 def init_sheets():
     """Ensure gspread client and target worksheets are ready.
     Re-reads environment variables on each call to support late-binding.
@@ -60,25 +92,19 @@ def init_sheets():
     if not SPREADSHEET_ID or not SERVICE_ACCOUNT_JSON:
         return False
     try:
-        # Parse JSON safely
-        try:
-            sa_info = json.loads(SERVICE_ACCOUNT_JSON)
-        except json.JSONDecodeError:
-            # Some environments may double-encode; try once more
-            sa_info = json.loads(json.loads(SERVICE_ACCOUNT_JSON))
+        sa_info = _parse_service_account_env(SERVICE_ACCOUNT_JSON)
         creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-        gc = gspread.authorize(creds)
-        global sh
-        sh = gc.open_by_key(SPREADSHEET_ID)
+        gc_local = gspread.authorize(creds)
+        sh_local = gc_local.open_by_key(SPREADSHEET_ID)
         # Ensure worksheets exist and have headers
         try:
-            users_ws_local = sh.worksheet("Users")
+            users_ws_local = sh_local.worksheet("Users")
         except gspread.exceptions.WorksheetNotFound:
-            users_ws_local = sh.add_worksheet(title="Users", rows=1000, cols=10)
+            users_ws_local = sh_local.add_worksheet(title="Users", rows=1000, cols=10)
         try:
-            messages_ws_local = sh.worksheet("Messages")
+            messages_ws_local = sh_local.worksheet("Messages")
         except gspread.exceptions.WorksheetNotFound:
-            messages_ws_local = sh.add_worksheet(title="Messages", rows=2000, cols=12)
+            messages_ws_local = sh_local.add_worksheet(title="Messages", rows=2000, cols=12)
 
         # Ensure headers
         def ensure_headers(ws, headers):
@@ -92,7 +118,10 @@ def init_sheets():
         ensure_headers(users_ws_local, ["id", "name", "username", "email", "password_hash", "created_at"])
         ensure_headers(messages_ws_local, ["id", "sender", "receiver", "type", "text", "media_url", "created_at"])
 
-        global users_ws, messages_ws
+        # Assign globals last upon success
+        global gc, sh, users_ws, messages_ws
+        gc = gc_local
+        sh = sh_local
         users_ws = users_ws_local
         messages_ws = messages_ws_local
         return True
