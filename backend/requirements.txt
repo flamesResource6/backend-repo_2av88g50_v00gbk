@@ -1,0 +1,6 @@
+fastapi==0.110.0
+uvicorn==0.29.0
+pydantic==2.6.4
+gspread==6.1.2
+google-auth==2.34.0
+python-multipart==0.0.9
