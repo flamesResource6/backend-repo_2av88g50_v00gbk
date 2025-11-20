@@ -2,7 +2,7 @@ import os
 import uuid
 import json
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -345,6 +345,55 @@ def history(user1: str, user2: str, limit: int = 100):
             })
     convo = sorted(convo, key=lambda x: x["created_at"])[:limit]
     return {"messages": convo}
+
+
+@app.get("/conversations")
+def conversations(user: str, limit: int = 50):
+    """Return recent conversations for a user with last message preview.
+    Sorted by last activity desc.
+    """
+    if not init_sheets():
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    # Build username -> (id, name) map
+    users_map: Dict[str, Dict[str, Any]] = {}
+    for row in read_all(users_ws):
+        u_id, u_name, u_username, *_ = row + [None] * 6
+        if u_username:
+            users_map[u_username] = {"id": u_id, "name": u_name, "username": u_username}
+
+    # Aggregate last message per peer
+    last_map: Dict[str, Dict[str, Any]] = {}
+    for r in read_all(messages_ws):
+        m_id, sender, receiver, m_type, m_text, m_media, m_created = r + [None] * 7
+        if sender == user:
+            peer = receiver
+        elif receiver == user:
+            peer = sender
+        else:
+            continue
+        if not peer:
+            continue
+        cur = last_map.get(peer)
+        if (not cur) or (m_created and m_created > cur["created_at"]):
+            last_map[peer] = {
+                "peer": peer,
+                "last": {
+                    "id": m_id,
+                    "sender": sender,
+                    "receiver": receiver,
+                    "type": m_type,
+                    "text": m_text,
+                    "media_url": m_media if m_media else None,
+                    "created_at": m_created,
+                },
+                "peer_name": users_map.get(peer, {}).get("name"),
+                "peer_id": users_map.get(peer, {}).get("id"),
+            }
+
+    items = list(last_map.values())
+    items.sort(key=lambda x: (x["last"].get("created_at") or ""), reverse=True)
+    return {"conversations": items[:limit]}
 
 
 @app.get("/__debug/selftest")
