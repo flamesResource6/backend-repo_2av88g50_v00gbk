@@ -8,7 +8,6 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
-from passlib.context import CryptContext
 
 from dotenv import load_dotenv
 import gspread
@@ -32,14 +31,6 @@ app.add_middleware(
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
-
-# Use bcrypt_sha256 to avoid 72-byte password limit while remaining bcrypt-based
-# Include bcrypt as secondary for legacy hashes; disable truncate errors if it gets picked.
-pwd_context = CryptContext(
-    schemes=["bcrypt_sha256", "bcrypt"],
-    deprecated="auto",
-    bcrypt__truncate_error=False,
-)
 
 # Google Sheets Setup (globals initialized, refreshed inside init_sheets)
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
@@ -159,79 +150,37 @@ def debug_users():
     return {"head": users_ws.get_all_values()[:20]}
 
 
-def is_passphrase(password: str) -> bool:
-    """Heuristic: if password has more than 5 whitespace-separated words, treat as passphrase."""
-    parts = [p for p in password.strip().split() if p]
-    return len(parts) > 5
+# Simple, bcrypt-free password hashing using PBKDF2-HMAC-SHA256
+# Format: pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>
+PBKDF2_ALGO = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 200_000
+SALT_BYTES = 16
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(SALT_BYTES).hex()
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS)
+    return f"{PBKDF2_ALGO}${PBKDF2_ITERATIONS}${salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iterations_str, salt_hex, hash_hex = stored.split("$")
+        if algo != PBKDF2_ALGO:
+            # Unknown/legacy hash (e.g., bcrypt). Since bcrypt is removed, treat as non-match.
+            return False
+        iterations = int(iterations_str)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), iterations)
+        return dk.hex() == hash_hex
+    except Exception:
+        return False
 
 
 @app.get("/__debug/hash")
 def debug_hash(pw: str):
-    """Hash a password, applying the 5+ words passphrase rule before hashing.
-    Reports whether the rule was applied or a fallback due to backend error occurred.
-    """
-    used_rule = is_passphrase(pw)
-    try:
-        if used_rule:
-            digest = hashlib.sha256(pw.encode("utf-8")).hexdigest()
-            h = pwd_context.hash(digest)
-            ok = pwd_context.verify(digest, h)
-            return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "passphrase_rule": True, "fallback_used": False}
-        else:
-            h = pwd_context.hash(pw)
-            ok = pwd_context.verify(pw, h)
-            return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "passphrase_rule": False, "fallback_used": False}
-    except Exception as e:
-        # Fallback due to backend constraints
-        digest = hashlib.sha256(pw.encode("utf-8")).hexdigest()
-        h = pwd_context.hash(digest)
-        ok = pwd_context.verify(digest, h)
-        return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "passphrase_rule": used_rule, "fallback_used": True, "error": str(e)}
-
-
-def hash_password_safe(password: str) -> str:
-    """Hash password using bcrypt_sha256.
-    If it has more than 5 words, prehash with sha256 first.
-    Also catches backend 72-byte issues and falls back to prehashing.
-    """
-    if is_passphrase(password):
-        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        return pwd_context.hash(digest)
-    try:
-        return pwd_context.hash(password)
-    except Exception:
-        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        return pwd_context.hash(digest)
-
-
-def verify_password_safe(password: str, stored_hash: str) -> bool:
-    """Verify password against stored hash.
-    If it has more than 5 words, try verifying a sha256 prehash first, then direct.
-    Otherwise try direct first, then sha256 prehash as fallback.
-    """
-    if is_passphrase(password):
-        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        try:
-            if pwd_context.verify(digest, stored_hash):
-                return True
-        except Exception:
-            pass
-        # Try direct just in case existing accounts were created without the rule
-        try:
-            return pwd_context.verify(password, stored_hash)
-        except Exception:
-            return False
-    else:
-        try:
-            if pwd_context.verify(password, stored_hash):
-                return True
-        except Exception:
-            pass
-        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        try:
-            return pwd_context.verify(digest, stored_hash)
-        except Exception:
-            return False
+    h = hash_password(pw)
+    ok = verify_password(pw, h)
+    return {"scheme": PBKDF2_ALGO, "hash": h, "verify": ok}
 
 
 @app.post("/register")
@@ -239,7 +188,7 @@ def register(req: RegisterRequest):
     if not init_sheets():
         raise HTTPException(status_code=500, detail="Google Sheets not configured")
 
-    # Basic password sanity check (allow any length, but not empty or all spaces)
+    # Allow any password (including long passphrases); only reject empty/whitespace-only
     if not req.password or not req.password.strip():
         raise HTTPException(status_code=400, detail="Password cannot be empty")
 
@@ -255,7 +204,7 @@ def register(req: RegisterRequest):
 
         uid = str(uuid.uuid4())
         try:
-            password_hash = hash_password_safe(req.password)
+            password_hash = hash_password(req.password)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Password hashing failed: {str(e)}")
         created_at = datetime.utcnow().isoformat()
@@ -279,7 +228,7 @@ def login(req: LoginRequest):
         u_id, u_name, u_username, u_email, u_hash, *_ = row + [None] * 6
         if req.identifier in (u_username, u_email):
             try:
-                ok = verify_password_safe(req.password, u_hash or "")
+                ok = verify_password(req.password, u_hash or "")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Password verify failed: {str(e)}")
             if not ok:
@@ -367,6 +316,32 @@ def history(user1: str, user2: str, limit: int = 100):
             })
     convo = sorted(convo, key=lambda x: x["created_at"])[:limit]
     return {"messages": convo}
+
+
+@app.get("/__debug/selftest")
+def selftest():
+    """Create a throwaway account with a long passphrase and a short password, then verify both locally.
+    Returns the usernames created and verification results. Writes rows to the Users sheet.
+    """
+    if not init_sheets():
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    created = []
+    tests = [
+        ("Pass One", f"u_{uuid.uuid4().hex[:8]}", f"u_{uuid.uuid4().hex[:8]}@example.com", "this is a really really really long pass phrase with many words"),
+        ("Pass Two", f"u_{uuid.uuid4().hex[:8]}", f"u_{uuid.uuid4().hex[:8]}@example.com", "Test123!"),
+    ]
+    results = []
+    for name, username, email, pw in tests:
+        uid = str(uuid.uuid4())
+        ph = hash_password(pw)
+        users_ws.append_row([uid, name, username, email, ph, datetime.utcnow().isoformat()], value_input_option="RAW")
+        # verify locally
+        ok = verify_password(pw, ph)
+        created.append({"id": uid, "username": username, "email": email})
+        results.append({"username": username, "verified": ok})
+
+    return {"created": created, "verify_results": results}
 
 
 if __name__ == "__main__":
