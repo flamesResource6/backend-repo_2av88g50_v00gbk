@@ -1,8 +1,18 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import uuid
+from datetime import datetime
+from typing import Optional, List
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+app = FastAPI(title="Slash Chat API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,57 +22,206 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+# Serve uploaded files
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Google Sheets Setup
+SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+gc = None
+sh = None
+users_ws = None
+messages_ws = None
+
+
+def init_sheets():
+    global gc, sh, users_ws, messages_ws
+    if not SPREADSHEET_ID or not SERVICE_ACCOUNT_JSON:
+        return False
+    try:
+        creds = Credentials.from_service_account_info(eval(SERVICE_ACCOUNT_JSON), scopes=SCOPES)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        # Ensure worksheets exist
+        try:
+            users_ws = sh.worksheet("Users")
+        except gspread.exceptions.WorksheetNotFound:
+            users_ws = sh.add_worksheet(title="Users", rows=1000, cols=10)
+            users_ws.append_row(["id", "name", "username", "email", "password_hash", "created_at"])
+        try:
+            messages_ws = sh.worksheet("Messages")
+        except gspread.exceptions.WorksheetNotFound:
+            messages_ws = sh.add_worksheet(title="Messages", rows=2000, cols=12)
+            messages_ws.append_row(["id", "sender", "receiver", "type", "text", "media_url", "created_at"])
+        return True
+    except Exception as e:
+        print("Sheets init error:", e)
+        return False
+
+
+@app.on_event("startup")
+def startup_event():
+    init_sheets()
+
+
+class RegisterRequest(BaseModel):
+    name: str
+    username: str
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    identifier: str  # username or email
+    password: str
+
+
+@app.get("/")
+def health():
+    return {"ok": True, "service": "Slash API"}
+
 
 @app.get("/test")
-def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
-        "backend": "✅ Running",
-        "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
-        "collections": []
+def test():
+    ok = init_sheets()
+    return {
+        "sheets": "connected" if ok else "not_configured",
+        "spreadsheet_id": bool(SPREADSHEET_ID),
+        "have_creds": bool(SERVICE_ACCOUNT_JSON),
     }
-    
-    try:
-        # Try to import database module
-        from database import db
-        
-        if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
-    except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
+
+
+def read_all(ws) -> List[List[str]]:
+    # returns all rows excluding header
+    values = ws.get_all_values()
+    if not values:
+        return []
+    if values and values[0] and values[0][0] == "id":
+        return values[1:]
+    return values
+
+
+@app.post("/register")
+def register(req: RegisterRequest):
+    if not init_sheets():
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    # Check duplicates by username/email
+    rows = read_all(users_ws)
+    for row in rows:
+        _, _, u_username, u_email, *_ = row + [None] * 6
+        if u_username == req.username:
+            raise HTTPException(status_code=400, detail="Username already exists")
+        if u_email == req.email:
+            raise HTTPException(status_code=400, detail="Email already exists")
+
+    uid = str(uuid.uuid4())
+    password_hash = pwd_context.hash(req.password)
+    created_at = datetime.utcnow().isoformat()
+
+    users_ws.append_row([uid, req.name, req.username, req.email, password_hash, created_at])
+    return {"id": uid, "name": req.name, "username": req.username, "email": req.email, "created_at": created_at}
+
+
+@app.post("/login")
+def login(req: LoginRequest):
+    if not init_sheets():
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    rows = read_all(users_ws)
+    for row in rows:
+        u_id, u_name, u_username, u_email, u_hash, *_ = row + [None] * 6
+        if req.identifier in (u_username, u_email):
+            if not pwd_context.verify(req.password, u_hash):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            return {"id": u_id, "name": u_name, "username": u_username, "email": u_email}
+
+    raise HTTPException(status_code=404, detail="User not found")
+
+
+@app.get("/users/search")
+def search_users(q: str):
+    if not init_sheets():
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+    q = q.lower()
+    results = []
+    for row in read_all(users_ws):
+        u_id, u_name, u_username, u_email, *_ = row + [None] * 6
+        if u_username and q in u_username.lower():
+            results.append({"id": u_id, "name": u_name, "username": u_username})
+    return {"results": results}
+
+
+@app.post("/messages/send")
+async def send_message(
+    sender: str = Form(...),
+    receiver: str = Form(...),
+    type: str = Form("text"),  # text | image | video | audio
+    text: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+):
+    if not init_sheets():
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    msg_id = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat()
+    media_url = None
+
+    if file is not None:
+        ext = os.path.splitext(file.filename)[1]
+        fname = f"{msg_id}{ext}"
+        fpath = os.path.join(UPLOAD_DIR, fname)
+        with open(fpath, "wb") as out:
+            out.write(await file.read())
+        media_url = f"/uploads/{fname}"
+
+    if type == "text" and not text:
+        raise HTTPException(status_code=400, detail="Text is required for text messages")
+
+    messages_ws.append_row([msg_id, sender, receiver, type, text or "", media_url or "", created_at])
+
+    return {
+        "id": msg_id,
+        "sender": sender,
+        "receiver": receiver,
+        "type": type,
+        "text": text,
+        "media_url": media_url,
+        "created_at": created_at,
+    }
+
+
+@app.get("/messages/history")
+def history(user1: str, user2: str, limit: int = 100):
+    if not init_sheets():
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    all_rows = read_all(messages_ws)
+    convo = []
+    for r in all_rows:
+        m_id, sender, receiver, m_type, m_text, m_media, m_created = r + [None] * 7
+        if (sender == user1 and receiver == user2) or (sender == user2 and receiver == user1):
+            convo.append({
+                "id": m_id,
+                "sender": sender,
+                "receiver": receiver,
+                "type": m_type,
+                "text": m_text,
+                "media_url": m_media if m_media else None,
+                "created_at": m_created,
+            })
+    convo = sorted(convo, key=lambda x: x["created_at"])[:limit]
+    return {"messages": convo}
 
 
 if __name__ == "__main__":
