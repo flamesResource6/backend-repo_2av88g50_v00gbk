@@ -32,7 +32,8 @@ UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Use bcrypt_sha256 to avoid 72-byte password limit while remaining bcrypt-based
+pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
 # Google Sheets Setup (globals initialized, refreshed inside init_sheets)
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
@@ -69,6 +70,7 @@ def init_sheets():
             # Some environments may double-encode; try once more
             sa_info = json.loads(json.loads(SERVICE_ACCOUNT_JSON))
         creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+        global gc, sh
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SPREADSHEET_ID)
         # Ensure worksheets exist and have headers
@@ -86,14 +88,14 @@ def init_sheets():
             values = ws.get_all_values()
             if not values or not values[0] or values[0] != headers:
                 if not values:
-                    ws.append_row(headers)
+                    ws.append_row(headers, value_input_option="RAW")
                 else:
-                    # Try to set headers in first row
                     ws.update('A1', [headers])
 
         ensure_headers(users_ws_local, ["id", "name", "username", "email", "password_hash", "created_at"])
         ensure_headers(messages_ws_local, ["id", "sender", "receiver", "type", "text", "media_url", "created_at"])
 
+        global users_ws, messages_ws
         users_ws = users_ws_local
         messages_ws = messages_ws_local
         return True
@@ -144,26 +146,39 @@ def read_all(ws) -> List[List[str]]:
     return values
 
 
+@app.get("/__debug/users")
+def debug_users():
+    if not init_sheets():
+        return {"ok": False, "error": "sheets not configured"}
+    return {"head": users_ws.get_all_values()[:20]}
+
+
 @app.post("/register")
 def register(req: RegisterRequest):
     if not init_sheets():
         raise HTTPException(status_code=500, detail="Google Sheets not configured")
 
-    # Check duplicates by username/email
-    rows = read_all(users_ws)
-    for row in rows:
-        _, _, u_username, u_email, *_ = row + [None] * 6
-        if u_username == req.username:
-            raise HTTPException(status_code=400, detail="Username already exists")
-        if u_email == req.email:
-            raise HTTPException(status_code=400, detail="Email already exists")
+    try:
+        # Check duplicates by username/email
+        rows = read_all(users_ws)
+        for row in rows:
+            _, _, u_username, u_email, *_ = row + [None] * 6
+            if u_username == req.username:
+                raise HTTPException(status_code=400, detail="Username already exists")
+            if u_email == req.email:
+                raise HTTPException(status_code=400, detail="Email already exists")
 
-    uid = str(uuid.uuid4())
-    password_hash = pwd_context.hash(req.password)
-    created_at = datetime.utcnow().isoformat()
+        uid = str(uuid.uuid4())
+        password_hash = pwd_context.hash(req.password)
+        created_at = datetime.utcnow().isoformat()
 
-    users_ws.append_row([uid, req.name, req.username, req.email, password_hash, created_at])
-    return {"id": uid, "name": req.name, "username": req.username, "email": req.email, "created_at": created_at}
+        users_ws.append_row([uid, req.name, req.username, req.email, password_hash, created_at], value_input_option="RAW")
+        return {"id": uid, "name": req.name, "username": req.username, "email": req.email, "created_at": created_at}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Surface errors to client for easier debugging
+        raise HTTPException(status_code=500, detail=f"Register failed: {str(e)}")
 
 
 @app.post("/login")
@@ -175,7 +190,7 @@ def login(req: LoginRequest):
     for row in rows:
         u_id, u_name, u_username, u_email, u_hash, *_ = row + [None] * 6
         if req.identifier in (u_username, u_email):
-            if not pwd_context.verify(req.password, u_hash):
+            if not pwd_context.verify(req.password, u_hash or ""):
                 raise HTTPException(status_code=401, detail="Invalid credentials")
             return {"id": u_id, "name": u_name, "username": u_username, "email": u_email}
 
@@ -206,32 +221,37 @@ async def send_message(
     if not init_sheets():
         raise HTTPException(status_code=500, detail="Google Sheets not configured")
 
-    msg_id = str(uuid.uuid4())
-    created_at = datetime.utcnow().isoformat()
-    media_url = None
+    try:
+        msg_id = str(uuid.uuid4())
+        created_at = datetime.utcnow().isoformat()
+        media_url = None
 
-    if file is not None:
-        ext = os.path.splitext(file.filename)[1]
-        fname = f"{msg_id}{ext}"
-        fpath = os.path.join(UPLOAD_DIR, fname)
-        with open(fpath, "wb") as out:
-            out.write(await file.read())
-        media_url = f"/uploads/{fname}"
+        if file is not None:
+            ext = os.path.splitext(file.filename)[1]
+            fname = f"{msg_id}{ext}"
+            fpath = os.path.join(UPLOAD_DIR, fname)
+            with open(fpath, "wb") as out:
+                out.write(await file.read())
+            media_url = f"/uploads/{fname}"
 
-    if type == "text" and not text:
-        raise HTTPException(status_code=400, detail="Text is required for text messages")
+        if type == "text" and not text:
+            raise HTTPException(status_code=400, detail="Text is required for text messages")
 
-    messages_ws.append_row([msg_id, sender, receiver, type, text or "", media_url or "", created_at])
+        messages_ws.append_row([msg_id, sender, receiver, type, text or "", media_url or "", created_at], value_input_option="RAW")
 
-    return {
-        "id": msg_id,
-        "sender": sender,
-        "receiver": receiver,
-        "type": type,
-        "text": text,
-        "media_url": media_url,
-        "created_at": created_at,
-    }
+        return {
+            "id": msg_id,
+            "sender": sender,
+            "receiver": receiver,
+            "type": type,
+            "text": text,
+            "media_url": media_url,
+            "created_at": created_at,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Send failed: {str(e)}")
 
 
 @app.get("/messages/history")
