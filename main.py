@@ -14,6 +14,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 import hashlib
 
+# Optional MongoDB fallback
+from database import db
+
 # Load environment variables from .env
 load_dotenv()
 
@@ -155,11 +158,15 @@ def health():
 @app.get("/test")
 def test():
     ok = init_sheets()
-    return {
+    status = {
         "sheets": "connected" if ok else "not_configured",
         "spreadsheet_id": bool(SPREADSHEET_ID),
         "have_creds": bool(SERVICE_ACCOUNT_JSON),
+        "mongo": bool(db is not None),
     }
+    # If sheets not configured, we still operate using Mongo fallback
+    status["operational"] = ok or bool(db is not None)
+    return status
 
 
 def read_all(ws) -> List[List[str]]:
@@ -174,9 +181,13 @@ def read_all(ws) -> List[List[str]]:
 
 @app.get("/__debug/users")
 def debug_users():
-    if not init_sheets():
-        return {"ok": False, "error": "sheets not configured"}
-    return {"head": users_ws.get_all_values()[:20]}
+    if init_sheets():
+        return {"head": users_ws.get_all_values()[:20]}
+    # Fallback: MongoDB sample
+    if db is None:
+        return {"ok": False, "error": "sheets and mongo not available"}
+    docs = list(db["users"].find({}, {"_id": 0}).limit(20))
+    return {"head": docs}
 
 
 # Simple, bcrypt-free password hashing using PBKDF2-HMAC-SHA256
@@ -214,70 +225,100 @@ def debug_hash(pw: str):
 
 @app.post("/register")
 def register(req: RegisterRequest):
-    if not init_sheets():
-        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+    sheets_ok = init_sheets()
 
     # Allow any password (including long passphrases); only reject empty/whitespace-only
     if not req.password or not req.password.strip():
         raise HTTPException(status_code=400, detail="Password cannot be empty")
 
+    # Check duplicates + write
     try:
-        # Check duplicates by username/email
-        rows = read_all(users_ws)
-        for row in rows:
-            _, _, u_username, u_email, *_ = row + [None] * 6
-            if u_username == req.username:
-                raise HTTPException(status_code=400, detail="Username already exists")
-            if u_email == req.email:
-                raise HTTPException(status_code=400, detail="Email already exists")
+        if sheets_ok:
+            rows = read_all(users_ws)
+            for row in rows:
+                _, _, u_username, u_email, *_ = row + [None] * 6
+                if u_username == req.username:
+                    raise HTTPException(status_code=400, detail="Username already exists")
+                if u_email == req.email:
+                    raise HTTPException(status_code=400, detail="Email already exists")
 
-        uid = str(uuid.uuid4())
-        try:
+            uid = str(uuid.uuid4())
             password_hash = hash_password(req.password)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Password hashing failed: {str(e)}")
-        created_at = datetime.utcnow().isoformat()
-
-        users_ws.append_row([uid, req.name, req.username, req.email, password_hash, created_at], value_input_option="RAW")
-        return {"id": uid, "name": req.name, "username": req.username, "email": req.email, "created_at": created_at}
+            created_at = datetime.utcnow().isoformat()
+            users_ws.append_row([uid, req.name, req.username, req.email, password_hash, created_at], value_input_option="RAW")
+            return {"id": uid, "name": req.name, "username": req.username, "email": req.email, "created_at": created_at}
+        else:
+            # Mongo fallback
+            if db is None:
+                raise HTTPException(status_code=500, detail="Storage not available")
+            # Unique checks
+            dupe = db["users"].find_one({"$or": [{"username": req.username}, {"email": req.email}]})
+            if dupe:
+                if dupe.get("username") == req.username:
+                    raise HTTPException(status_code=400, detail="Username already exists")
+                raise HTTPException(status_code=400, detail="Email already exists")
+            uid = str(uuid.uuid4())
+            doc = {
+                "id": uid,
+                "name": req.name,
+                "username": req.username,
+                "email": req.email,
+                "password_hash": hash_password(req.password),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            db["users"].insert_one(doc)
+            return {k: doc[k] for k in ["id", "name", "username", "email", "created_at"]}
     except HTTPException:
         raise
     except Exception as e:
-        # Surface errors to client for easier debugging
         raise HTTPException(status_code=500, detail=f"Register failed: {str(e)}")
 
 
 @app.post("/login")
 def login(req: LoginRequest):
-    if not init_sheets():
-        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+    sheets_ok = init_sheets()
 
-    rows = read_all(users_ws)
-    for row in rows:
-        u_id, u_name, u_username, u_email, u_hash, *_ = row + [None] * 6
-        if req.identifier in (u_username, u_email):
-            try:
-                ok = verify_password(req.password, u_hash or "")
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Password verify failed: {str(e)}")
-            if not ok:
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-            return {"id": u_id, "name": u_name, "username": u_username, "email": u_email}
-
-    raise HTTPException(status_code=404, detail="User not found")
+    if sheets_ok:
+        rows = read_all(users_ws)
+        for row in rows:
+            u_id, u_name, u_username, u_email, u_hash, *_ = row + [None] * 6
+            if req.identifier in (u_username, u_email):
+                try:
+                    ok = verify_password(req.password, u_hash or "")
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Password verify failed: {str(e)}")
+                if not ok:
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
+                return {"id": u_id, "name": u_name, "username": u_username, "email": u_email}
+        raise HTTPException(status_code=404, detail="User not found")
+    else:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Storage not available")
+        user = db["users"].find_one({"$or": [{"username": req.identifier}, {"email": req.identifier}]})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if not verify_password(req.password, user.get("password_hash", "")):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        return {k: user.get(k) for k in ["id", "name", "username", "email"]}
 
 
 @app.get("/users/search")
 def search_users(q: str):
-    if not init_sheets():
-        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+    sheets_ok = init_sheets()
     q = q.lower()
-    results = []
-    for row in read_all(users_ws):
-        u_id, u_name, u_username, u_email, *_ = row + [None] * 6
-        if u_username and q in u_username.lower():
-            results.append({"id": u_id, "name": u_name, "username": u_username})
-    return {"results": results}
+
+    if sheets_ok:
+        results = []
+        for row in read_all(users_ws):
+            u_id, u_name, u_username, u_email, *_ = row + [None] * 6
+            if u_username and q in u_username.lower():
+                results.append({"id": u_id, "name": u_name, "username": u_username})
+        return {"results": results}
+    else:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Storage not available")
+        cursor = db["users"].find({"username": {"$regex": q, "$options": "i"}}, {"_id": 0, "id": 1, "name": 1, "username": 1})
+        return {"results": list(cursor)}
 
 
 @app.post("/messages/send")
@@ -288,8 +329,7 @@ async def send_message(
     text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ):
-    if not init_sheets():
-        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+    sheets_ok = init_sheets()
 
     try:
         msg_id = str(uuid.uuid4())
@@ -307,7 +347,20 @@ async def send_message(
         if type == "text" and not text:
             raise HTTPException(status_code=400, detail="Text is required for text messages")
 
-        messages_ws.append_row([msg_id, sender, receiver, type, text or "", media_url or "", created_at], value_input_option="RAW")
+        if sheets_ok:
+            messages_ws.append_row([msg_id, sender, receiver, type, text or "", media_url or "", created_at], value_input_option="RAW")
+        else:
+            if db is None:
+                raise HTTPException(status_code=500, detail="Storage not available")
+            db["messages"].insert_one({
+                "id": msg_id,
+                "sender": sender,
+                "receiver": receiver,
+                "type": type,
+                "text": text or "",
+                "media_url": media_url or "",
+                "created_at": created_at,
+            })
 
         return {
             "id": msg_id,
@@ -326,59 +379,15 @@ async def send_message(
 
 @app.get("/messages/history")
 def history(user1: str, user2: str, limit: int = 100):
-    if not init_sheets():
-        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+    sheets_ok = init_sheets()
 
-    all_rows = read_all(messages_ws)
-    convo = []
-    for r in all_rows:
-        m_id, sender, receiver, m_type, m_text, m_media, m_created = r + [None] * 7
-        if (sender == user1 and receiver == user2) or (sender == user2 and receiver == user1):
-            convo.append({
-                "id": m_id,
-                "sender": sender,
-                "receiver": receiver,
-                "type": m_type,
-                "text": m_text,
-                "media_url": m_media if m_media else None,
-                "created_at": m_created,
-            })
-    convo = sorted(convo, key=lambda x: x["created_at"])[:limit]
-    return {"messages": convo}
-
-
-@app.get("/conversations")
-def conversations(user: str, limit: int = 50):
-    """Return recent conversations for a user with last message preview.
-    Sorted by last activity desc.
-    """
-    if not init_sheets():
-        raise HTTPException(status_code=500, detail="Google Sheets not configured")
-
-    # Build username -> (id, name) map
-    users_map: Dict[str, Dict[str, Any]] = {}
-    for row in read_all(users_ws):
-        u_id, u_name, u_username, *_ = row + [None] * 6
-        if u_username:
-            users_map[u_username] = {"id": u_id, "name": u_name, "username": u_username}
-
-    # Aggregate last message per peer
-    last_map: Dict[str, Dict[str, Any]] = {}
-    for r in read_all(messages_ws):
-        m_id, sender, receiver, m_type, m_text, m_media, m_created = r + [None] * 7
-        if sender == user:
-            peer = receiver
-        elif receiver == user:
-            peer = sender
-        else:
-            continue
-        if not peer:
-            continue
-        cur = last_map.get(peer)
-        if (not cur) or (m_created and m_created > cur["created_at"]):
-            last_map[peer] = {
-                "peer": peer,
-                "last": {
+    if sheets_ok:
+        all_rows = read_all(messages_ws)
+        convo = []
+        for r in all_rows:
+            m_id, sender, receiver, m_type, m_text, m_media, m_created = r + [None] * 7
+            if (sender == user1 and receiver == user2) or (sender == user2 and receiver == user1):
+                convo.append({
                     "id": m_id,
                     "sender": sender,
                     "receiver": receiver,
@@ -386,23 +395,121 @@ def conversations(user: str, limit: int = 50):
                     "text": m_text,
                     "media_url": m_media if m_media else None,
                     "created_at": m_created,
-                },
-                "peer_name": users_map.get(peer, {}).get("name"),
-                "peer_id": users_map.get(peer, {}).get("id"),
-            }
+                })
+        convo = sorted(convo, key=lambda x: x["created_at"])[:limit]
+        return {"messages": convo}
+    else:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Storage not available")
+        cursor = db["messages"].find({
+            "$or": [
+                {"sender": user1, "receiver": user2},
+                {"sender": user2, "receiver": user1},
+            ]
+        }, {"_id": 0})
+        msgs = sorted(list(cursor), key=lambda x: x.get("created_at", ""))[:limit]
+        # Normalize empty media_url to None
+        for m in msgs:
+            if not m.get("media_url"):
+                m["media_url"] = None
+        return {"messages": msgs}
 
-    items = list(last_map.values())
-    items.sort(key=lambda x: (x["last"].get("created_at") or ""), reverse=True)
-    return {"conversations": items[:limit]}
+
+@app.get("/conversations")
+def conversations(user: str, limit: int = 50):
+    """Return recent conversations for a user with last message preview.
+    Sorted by last activity desc.
+    """
+    sheets_ok = init_sheets()
+
+    if sheets_ok:
+        # Build username -> (id, name) map
+        users_map: Dict[str, Dict[str, Any]] = {}
+        for row in read_all(users_ws):
+            u_id, u_name, u_username, *_ = row + [None] * 6
+            if u_username:
+                users_map[u_username] = {"id": u_id, "name": u_name, "username": u_username}
+
+        # Aggregate last message per peer
+        last_map: Dict[str, Dict[str, Any]] = {}
+        for r in read_all(messages_ws):
+            m_id, sender, receiver, m_type, m_text, m_media, m_created = r + [None] * 7
+            if sender == user:
+                peer = receiver
+            elif receiver == user:
+                peer = sender
+            else:
+                continue
+            if not peer:
+                continue
+            cur = last_map.get(peer)
+            if (not cur) or (m_created and m_created > cur["created_at"]):
+                last_map[peer] = {
+                    "peer": peer,
+                    "last": {
+                        "id": m_id,
+                        "sender": sender,
+                        "receiver": receiver,
+                        "type": m_type,
+                        "text": m_text,
+                        "media_url": m_media if m_media else None,
+                        "created_at": m_created,
+                    },
+                    "peer_name": users_map.get(peer, {}).get("name"),
+                    "peer_id": users_map.get(peer, {}).get("id"),
+                    "created_at": m_created,
+                }
+
+        items = list(last_map.values())
+        items.sort(key=lambda x: (x["last"].get("created_at") or ""), reverse=True)
+        return {"conversations": items[:limit]}
+    else:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Storage not available")
+        # Build users map
+        ucursor = db["users"].find({}, {"_id": 0, "username": 1, "id": 1, "name": 1})
+        users_map = {u["username"]: {"id": u.get("id"), "name": u.get("name"), "username": u.get("username")} for u in ucursor}
+        last_map: Dict[str, Dict[str, Any]] = {}
+        for r in db["messages"].find({}, {"_id": 0}):
+            sender = r.get("sender")
+            receiver = r.get("receiver")
+            if sender == user:
+                peer = receiver
+            elif receiver == user:
+                peer = sender
+            else:
+                continue
+            if not peer:
+                continue
+            cur = last_map.get(peer)
+            m_created = r.get("created_at", "")
+            if (not cur) or (m_created and m_created > cur["created_at"]):
+                last_map[peer] = {
+                    "peer": peer,
+                    "last": {
+                        "id": r.get("id"),
+                        "sender": sender,
+                        "receiver": receiver,
+                        "type": r.get("type"),
+                        "text": r.get("text"),
+                        "media_url": r.get("media_url") or None,
+                        "created_at": m_created,
+                    },
+                    "peer_name": users_map.get(peer, {}).get("name"),
+                    "peer_id": users_map.get(peer, {}).get("id"),
+                    "created_at": m_created,
+                }
+        items = list(last_map.values())
+        items.sort(key=lambda x: (x["last"].get("created_at") or ""), reverse=True)
+        return {"conversations": items[:limit]}
 
 
 @app.get("/__debug/selftest")
 def selftest():
     """Create a throwaway account with a long passphrase and a short password, then verify both locally.
-    Returns the usernames created and verification results. Writes rows to the Users sheet.
+    Returns the usernames created and verification results. Writes rows to the Users sheet or Mongo.
     """
-    if not init_sheets():
-        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+    sheets_ok = init_sheets()
 
     created = []
     tests = [
@@ -413,8 +520,19 @@ def selftest():
     for name, username, email, pw in tests:
         uid = str(uuid.uuid4())
         ph = hash_password(pw)
-        users_ws.append_row([uid, name, username, email, ph, datetime.utcnow().isoformat()], value_input_option="RAW")
-        # verify locally
+        if sheets_ok:
+            users_ws.append_row([uid, name, username, email, ph, datetime.utcnow().isoformat()], value_input_option="RAW")
+        else:
+            if db is None:
+                raise HTTPException(status_code=500, detail="Storage not available")
+            db["users"].insert_one({
+                "id": uid,
+                "name": name,
+                "username": username,
+                "email": email,
+                "password_hash": ph,
+                "created_at": datetime.utcnow().isoformat(),
+            })
         ok = verify_password(pw, ph)
         created.append({"id": uid, "username": username, "email": email})
         results.append({"username": username, "verified": ok})
