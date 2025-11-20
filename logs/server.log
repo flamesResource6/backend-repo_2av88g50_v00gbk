@@ -1,35 +1,7 @@
 INFO:     Will watch for changes in these directories: ['/home/workspace']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [1001] using StatReload
-INFO:     Started server process [1003]
+INFO:     Started reloader process [1136] using StatReload
+INFO:     Started server process [1138]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     172.20.0.1:43498 - "HEAD / HTTP/1.1" 405 Method Not Allowed
-(trapped) error reading bcrypt version
-Traceback (most recent call last):
-  File "/usr/local/lib/python3.13/site-packages/passlib/handlers/bcrypt.py", line 620, in _load_backend_mixin
-    version = _bcrypt.__about__.__version__
-              ^^^^^^^^^^^^^^^^^
-AttributeError: module 'bcrypt' has no attribute '__about__'
-INFO:     172.20.0.1:32900 - "POST /register HTTP/1.1" 500 Internal Server Error
-(trapped) error reading bcrypt version
-Traceback (most recent call last):
-  File "/usr/local/lib/python3.13/site-packages/passlib/handlers/bcrypt.py", line 620, in _load_backend_mixin
-    version = _bcrypt.__about__.__version__
-              ^^^^^^^^^^^^^^^^^
-AttributeError: module 'bcrypt' has no attribute '__about__'
-INFO:     172.20.0.1:43522 - "POST /register HTTP/1.1" 500 Internal Server Error
-(trapped) error reading bcrypt version
-Traceback (most recent call last):
-  File "/usr/local/lib/python3.13/site-packages/passlib/handlers/bcrypt.py", line 620, in _load_backend_mixin
-    version = _bcrypt.__about__.__version__
-              ^^^^^^^^^^^^^^^^^
-AttributeError: module 'bcrypt' has no attribute '__about__'
-INFO:     172.20.0.1:54024 - "POST /register HTTP/1.1" 500 Internal Server Error
-(trapped) error reading bcrypt version
-Traceback (most recent call last):
-  File "/usr/local/lib/python3.13/site-packages/passlib/handlers/bcrypt.py", line 620, in _load_backend_mixin
-    version = _bcrypt.__about__.__version__
-              ^^^^^^^^^^^^^^^^^
-AttributeError: module 'bcrypt' has no attribute '__about__'
-INFO:     172.20.0.1:48146 - "POST /register HTTP/1.1" 500 Internal Server Error
+INFO:     172.20.0.1:56912 - "HEAD / HTTP/1.1" 405 Method Not Allowed

@@ -13,6 +13,7 @@ from passlib.context import CryptContext
 from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
+import hashlib
 
 # Load environment variables from .env
 load_dotenv()
@@ -33,7 +34,12 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Use bcrypt_sha256 to avoid 72-byte password limit while remaining bcrypt-based
-pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
+# Include bcrypt as secondary for legacy hashes; disable truncate errors if it gets picked.
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256", "bcrypt"],
+    deprecated="auto",
+    bcrypt__truncate_error=False,
+)
 
 # Google Sheets Setup (globals initialized, refreshed inside init_sheets)
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
@@ -70,8 +76,8 @@ def init_sheets():
             # Some environments may double-encode; try once more
             sa_info = json.loads(json.loads(SERVICE_ACCOUNT_JSON))
         creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-        global gc, sh
         gc = gspread.authorize(creds)
+        global sh
         sh = gc.open_by_key(SPREADSHEET_ID)
         # Ensure worksheets exist and have headers
         try:
@@ -153,10 +159,59 @@ def debug_users():
     return {"head": users_ws.get_all_values()[:20]}
 
 
+@app.get("/__debug/hash")
+def debug_hash(pw: str):
+    """Hash a password with the current context to verify hashing works and scheme used.
+    Also tries fallback path used during register if primary raises length error.
+    """
+    try:
+        h = pwd_context.hash(pw)
+        ok = pwd_context.verify(pw, h)
+        return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "fallback_used": False}
+    except Exception as e:
+        # Try fallback prehash
+        digest = hashlib.sha256(pw.encode("utf-8")).hexdigest()
+        h = pwd_context.hash(digest)
+        ok = pwd_context.verify(digest, h)
+        return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "fallback_used": True, "error": str(e)}
+
+
+def hash_password_safe(password: str) -> str:
+    """Hash password using bcrypt_sha256; if a backend raises the 72-byte error, prehash with sha256 and hash that.
+    """
+    try:
+        return pwd_context.hash(password)
+    except Exception:
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return pwd_context.hash(digest)
+
+
+def verify_password_safe(password: str, stored_hash: str) -> bool:
+    """Verify password against stored hash. If direct verify fails due to backend constraints,
+    retry by verifying a sha256 prehash (hex digest) of the password.
+    """
+    try:
+        if pwd_context.verify(password, stored_hash):
+            return True
+    except Exception:
+        # fall through to digest path
+        pass
+    # Try digest path
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    try:
+        return pwd_context.verify(digest, stored_hash)
+    except Exception:
+        return False
+
+
 @app.post("/register")
 def register(req: RegisterRequest):
     if not init_sheets():
         raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    # Basic password sanity check (allow any length, but not empty or all spaces)
+    if not req.password or not req.password.strip():
+        raise HTTPException(status_code=400, detail="Password cannot be empty")
 
     try:
         # Check duplicates by username/email
@@ -169,7 +224,10 @@ def register(req: RegisterRequest):
                 raise HTTPException(status_code=400, detail="Email already exists")
 
         uid = str(uuid.uuid4())
-        password_hash = pwd_context.hash(req.password)
+        try:
+            password_hash = hash_password_safe(req.password)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Password hashing failed: {str(e)}")
         created_at = datetime.utcnow().isoformat()
 
         users_ws.append_row([uid, req.name, req.username, req.email, password_hash, created_at], value_input_option="RAW")
@@ -190,7 +248,11 @@ def login(req: LoginRequest):
     for row in rows:
         u_id, u_name, u_username, u_email, u_hash, *_ = row + [None] * 6
         if req.identifier in (u_username, u_email):
-            if not pwd_context.verify(req.password, u_hash or ""):
+            try:
+                ok = verify_password_safe(req.password, u_hash or "")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Password verify failed: {str(e)}")
+            if not ok:
                 raise HTTPException(status_code=401, detail="Invalid credentials")
             return {"id": u_id, "name": u_name, "username": u_username, "email": u_email}
 
