@@ -34,6 +34,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 # ---------- Google Sheets Helpers ----------
 USERS_SHEET_NAME = "Users"
 MESSAGES_SHEET_NAME = "Messages"
+BLOCKS_SHEET_NAME = "Blocks"
 
 _cached_client = None
 _cached_spreadsheet = None
@@ -74,14 +75,34 @@ def get_spreadsheet():
     return _cached_spreadsheet
 
 
+def ensure_header(ws, required_headers: List[str]):
+    """Ensure the worksheet contains required headers; append missing ones."""
+    headers = ws.row_values(1)
+    changed = False
+    for h in required_headers:
+        if h not in headers:
+            headers.append(h)
+            changed = True
+    if changed:
+        ws.update("1:1", [headers])
+
+
 def ensure_worksheets(spreadsheet):
     existing = {ws.title for ws in spreadsheet.worksheets()}
     if USERS_SHEET_NAME not in existing:
-        ws = spreadsheet.add_worksheet(title=USERS_SHEET_NAME, rows=1000, cols=10)
-        ws.append_row(["id", "name", "username", "email", "password_hash", "created_at"]) 
+        ws = spreadsheet.add_worksheet(title=USERS_SHEET_NAME, rows=1000, cols=12)
+        ws.append_row(["id", "name", "username", "email", "password_hash", "created_at", "avatar_url"]) 
+    else:
+        ws = spreadsheet.worksheet(USERS_SHEET_NAME)
+        ensure_header(ws, ["id", "name", "username", "email", "password_hash", "created_at", "avatar_url"])
+
     if MESSAGES_SHEET_NAME not in existing:
-        ws = spreadsheet.add_worksheet(title=MESSAGES_SHEET_NAME, rows=1000, cols=12)
-        ws.append_row(["id", "sender", "receiver", "type", "text", "media_url", "created_at"]) 
+        ws2 = spreadsheet.add_worksheet(title=MESSAGES_SHEET_NAME, rows=2000, cols=12)
+        ws2.append_row(["id", "sender", "receiver", "type", "text", "media_url", "created_at"]) 
+    
+    if BLOCKS_SHEET_NAME not in existing:
+        ws3 = spreadsheet.add_worksheet(title=BLOCKS_SHEET_NAME, rows=1000, cols=6)
+        ws3.append_row(["blocker", "blocked", "created_at"]) 
 
 
 def users_sheet():
@@ -92,6 +113,11 @@ def users_sheet():
 def messages_sheet():
     ss = get_spreadsheet()
     return ss.worksheet(MESSAGES_SHEET_NAME)
+
+
+def blocks_sheet():
+    ss = get_spreadsheet()
+    return ss.worksheet(BLOCKS_SHEET_NAME)
 
 
 def hash_password(password: str) -> str:
@@ -117,6 +143,7 @@ class UserPublic(BaseModel):
     username: str
     email: EmailStr
     created_at: str
+    avatar_url: Optional[str] = None
 
 
 class Message(BaseModel):
@@ -127,6 +154,35 @@ class Message(BaseModel):
     text: Optional[str] = None
     media_url: Optional[str] = None
     created_at: str
+
+
+class BlockStatus(BaseModel):
+    blocked: bool
+    blocked_by: Optional[str] = None  # username of who placed the block
+
+
+# ---------- Utility ----------
+
+def header_index_map(ws) -> dict:
+    headers = ws.row_values(1)
+    return {h: i + 1 for i, h in enumerate(headers)}
+
+
+def is_blocked(u1: str, u2: str) -> BlockStatus:
+    """Return whether messaging between u1 and u2 is blocked and by whom."""
+    try:
+        ws = blocks_sheet()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sheets error: {e}")
+    records = ws.get_all_records()
+    for r in records:
+        blocker = str(r.get("blocker", "")).strip()
+        blocked = str(r.get("blocked", "")).strip()
+        if (blocker == u1 and blocked == u2) or (blocker == u2 and blocked == u1):
+            # If either side blocked the other, it's blocked for both
+            # Prefer to report the real blocker
+            return BlockStatus(blocked=True, blocked_by=blocker)
+    return BlockStatus(blocked=False, blocked_by=None)
 
 
 # ---------- Routes ----------
@@ -168,9 +224,12 @@ async def register(req: RegisterRequest):
     created_at = datetime.utcnow().isoformat()
     password_hash = hash_password(req.password)
 
-    ws.append_row([user_id, req.name, username, email, password_hash, created_at])
+    # Ensure avatar_url column exists
+    ensure_header(ws, ["avatar_url"])  # no-op if exists
 
-    return UserPublic(id=user_id, name=req.name, username=username, email=email, created_at=created_at)
+    ws.append_row([user_id, req.name, username, email, password_hash, created_at, ""])  # avatar empty
+
+    return UserPublic(id=user_id, name=req.name, username=username, email=email, created_at=created_at, avatar_url=None)
 
 
 @app.post("/login", response_model=UserPublic)
@@ -183,7 +242,7 @@ async def login(req: LoginRequest):
     key = req.username_or_email.strip().lower()
     records = ws.get_all_records()
     password_hash = hash_password(req.password)
-    for r in records:
+    for i, r in enumerate(records, start=2):  # start=2 because row 1 is header
         if r.get("username", "").strip().lower() == key or r.get("email", "").strip().lower() == key:
             if r.get("password_hash") == password_hash:
                 return UserPublic(
@@ -192,6 +251,7 @@ async def login(req: LoginRequest):
                     username=r.get("username"),
                     email=r.get("email"),
                     created_at=r.get("created_at"),
+                    avatar_url=r.get("avatar_url") or None,
                 )
             else:
                 raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -216,9 +276,110 @@ async def search_users(q: str):
                     username=r.get("username"),
                     email=r.get("email"),
                     created_at=r.get("created_at"),
+                    avatar_url=r.get("avatar_url") or None,
                 )
             )
-    return results[:25]
+    return results[:50]
+
+
+@app.get("/users/public", response_model=List[UserPublic])
+async def list_public_users():
+    try:
+        ws = users_sheet()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sheets error: {e}")
+
+    users: List[UserPublic] = []
+    for r in ws.get_all_records():
+        users.append(
+            UserPublic(
+                id=str(r.get("id")),
+                name=r.get("name"),
+                username=r.get("username"),
+                email=r.get("email"),
+                created_at=r.get("created_at"),
+                avatar_url=r.get("avatar_url") or None,
+            )
+        )
+    # Sort by name, then username
+    users.sort(key=lambda u: (u.name or "", u.username))
+    return users
+
+
+@app.post("/users/avatar", response_model=UserPublic)
+async def upload_avatar(username: str = Form(...), file: UploadFile = File(...)):
+    try:
+        ws = users_sheet()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sheets error: {e}")
+
+    headers = ws.row_values(1)
+    if "avatar_url" not in headers:
+        headers.append("avatar_url")
+        ws.update("1:1", [headers])
+    col_map = {h: i + 1 for i, h in enumerate(ws.row_values(1))}
+
+    # Save file
+    ext = os.path.splitext(file.filename or "")[1]
+    fname = f"avatar-{username}-{uuid.uuid4()}{ext}"
+    dest_path = os.path.join(UPLOAD_DIR, fname)
+    with open(dest_path, "wb") as f:
+        f.write(await file.read())
+    avatar_url = f"/uploads/{fname}"
+
+    # Find user row
+    records = ws.get_all_records()
+    for idx, r in enumerate(records, start=2):
+        if str(r.get("username", "")).strip() == username:
+            ws.update_cell(idx, col_map["avatar_url"], avatar_url)
+            return UserPublic(
+                id=str(r.get("id")),
+                name=r.get("name"),
+                username=r.get("username"),
+                email=r.get("email"),
+                created_at=r.get("created_at"),
+                avatar_url=avatar_url,
+            )
+    raise HTTPException(status_code=404, detail="User not found")
+
+
+@app.post("/block")
+async def block_user(blocker: str = Form(...), blocked: str = Form(...)):
+    if blocker == blocked:
+        raise HTTPException(status_code=400, detail="Cannot block yourself")
+    try:
+        ws = blocks_sheet()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sheets error: {e}")
+    # Check existing
+    for r in ws.get_all_records():
+        if str(r.get("blocker")) == blocker and str(r.get("blocked")) == blocked:
+            return {"status": "ok"}
+    ws.append_row([blocker, blocked, datetime.utcnow().isoformat()])
+    return {"status": "ok"}
+
+
+@app.post("/unblock")
+async def unblock_user(blocker: str = Form(...), blocked: str = Form(...)):
+    try:
+        ws = blocks_sheet()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sheets error: {e}")
+    records = ws.get_all_records()
+    # Find rows to delete; gspread row indices
+    rows_to_delete = []
+    for idx, r in enumerate(records, start=2):
+        if str(r.get("blocker")) == blocker and str(r.get("blocked")) == blocked:
+            rows_to_delete.append(idx)
+    # Delete from bottom to top
+    for row in reversed(rows_to_delete):
+        ws.delete_rows(row)
+    return {"status": "ok"}
+
+
+@app.get("/block/status", response_model=BlockStatus)
+async def block_status(user1: str, user2: str):
+    return is_blocked(user1, user2)
 
 
 @app.post("/messages/send", response_model=Message)
@@ -229,6 +390,11 @@ async def send_message(
     text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ):
+    # Enforce blocks in both directions
+    status = is_blocked(sender, receiver)
+    if status.blocked:
+        raise HTTPException(status_code=403, detail=f"Messaging blocked by {status.blocked_by}")
+
     try:
         ws = messages_sheet()
     except Exception as e:
