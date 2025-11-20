@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 from datetime import datetime
 from typing import Optional, List
 
@@ -33,7 +34,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Google Sheets Setup
+# Google Sheets Setup (globals initialized, refreshed inside init_sheets)
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
 
@@ -49,26 +50,52 @@ messages_ws = None
 
 
 def init_sheets():
-    global gc, sh, users_ws, messages_ws
-    # Re-read envs in case they were set after startup
-    global SPREADSHEET_ID, SERVICE_ACCOUNT_JSON
+    """Ensure gspread client and target worksheets are ready.
+    Re-reads environment variables on each call to support late-binding.
+    """
+    global gc, sh, users_ws, messages_ws, SPREADSHEET_ID, SERVICE_ACCOUNT_JSON
+
+    # Re-read envs in case they were set/updated after startup
+    SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
+    SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
+
     if not SPREADSHEET_ID or not SERVICE_ACCOUNT_JSON:
         return False
     try:
-        creds = Credentials.from_service_account_info(eval(SERVICE_ACCOUNT_JSON), scopes=SCOPES)
+        # Parse JSON safely
+        try:
+            sa_info = json.loads(SERVICE_ACCOUNT_JSON)
+        except json.JSONDecodeError:
+            # Some environments may double-encode; try once more
+            sa_info = json.loads(json.loads(SERVICE_ACCOUNT_JSON))
+        creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SPREADSHEET_ID)
-        # Ensure worksheets exist
+        # Ensure worksheets exist and have headers
         try:
-            users_ws = sh.worksheet("Users")
+            users_ws_local = sh.worksheet("Users")
         except gspread.exceptions.WorksheetNotFound:
-            users_ws = sh.add_worksheet(title="Users", rows=1000, cols=10)
-            users_ws.append_row(["id", "name", "username", "email", "password_hash", "created_at"])
+            users_ws_local = sh.add_worksheet(title="Users", rows=1000, cols=10)
         try:
-            messages_ws = sh.worksheet("Messages")
+            messages_ws_local = sh.worksheet("Messages")
         except gspread.exceptions.WorksheetNotFound:
-            messages_ws = sh.add_worksheet(title="Messages", rows=2000, cols=12)
-            messages_ws.append_row(["id", "sender", "receiver", "type", "text", "media_url", "created_at"])
+            messages_ws_local = sh.add_worksheet(title="Messages", rows=2000, cols=12)
+
+        # Ensure headers
+        def ensure_headers(ws, headers):
+            values = ws.get_all_values()
+            if not values or not values[0] or values[0] != headers:
+                if not values:
+                    ws.append_row(headers)
+                else:
+                    # Try to set headers in first row
+                    ws.update('A1', [headers])
+
+        ensure_headers(users_ws_local, ["id", "name", "username", "email", "password_hash", "created_at"])
+        ensure_headers(messages_ws_local, ["id", "sender", "receiver", "type", "text", "media_url", "created_at"])
+
+        users_ws = users_ws_local
+        messages_ws = messages_ws_local
         return True
     except Exception as e:
         print("Sheets init error:", e)
