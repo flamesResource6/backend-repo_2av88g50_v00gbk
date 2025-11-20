@@ -9,8 +9,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 
+from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
+
+# Load environment variables from .env
+load_dotenv()
 
 app = FastAPI(title="Slash Chat API")
 
@@ -46,6 +50,8 @@ messages_ws = None
 
 def init_sheets():
     global gc, sh, users_ws, messages_ws
+    # Re-read envs in case they were set after startup
+    global SPREADSHEET_ID, SERVICE_ACCOUNT_JSON
     if not SPREADSHEET_ID or not SERVICE_ACCOUNT_JSON:
         return False
     try:
