@@ -159,26 +159,44 @@ def debug_users():
     return {"head": users_ws.get_all_values()[:20]}
 
 
+def is_passphrase(password: str) -> bool:
+    """Heuristic: if password has more than 5 whitespace-separated words, treat as passphrase."""
+    parts = [p for p in password.strip().split() if p]
+    return len(parts) > 5
+
+
 @app.get("/__debug/hash")
 def debug_hash(pw: str):
-    """Hash a password with the current context to verify hashing works and scheme used.
-    Also tries fallback path used during register if primary raises length error.
+    """Hash a password, applying the 5+ words passphrase rule before hashing.
+    Reports whether the rule was applied or a fallback due to backend error occurred.
     """
+    used_rule = is_passphrase(pw)
     try:
-        h = pwd_context.hash(pw)
-        ok = pwd_context.verify(pw, h)
-        return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "fallback_used": False}
+        if used_rule:
+            digest = hashlib.sha256(pw.encode("utf-8")).hexdigest()
+            h = pwd_context.hash(digest)
+            ok = pwd_context.verify(digest, h)
+            return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "passphrase_rule": True, "fallback_used": False}
+        else:
+            h = pwd_context.hash(pw)
+            ok = pwd_context.verify(pw, h)
+            return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "passphrase_rule": False, "fallback_used": False}
     except Exception as e:
-        # Try fallback prehash
+        # Fallback due to backend constraints
         digest = hashlib.sha256(pw.encode("utf-8")).hexdigest()
         h = pwd_context.hash(digest)
         ok = pwd_context.verify(digest, h)
-        return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "fallback_used": True, "error": str(e)}
+        return {"scheme": "bcrypt_sha256", "hash": h, "verify": ok, "passphrase_rule": used_rule, "fallback_used": True, "error": str(e)}
 
 
 def hash_password_safe(password: str) -> str:
-    """Hash password using bcrypt_sha256; if a backend raises the 72-byte error, prehash with sha256 and hash that.
+    """Hash password using bcrypt_sha256.
+    If it has more than 5 words, prehash with sha256 first.
+    Also catches backend 72-byte issues and falls back to prehashing.
     """
+    if is_passphrase(password):
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return pwd_context.hash(digest)
     try:
         return pwd_context.hash(password)
     except Exception:
@@ -187,21 +205,33 @@ def hash_password_safe(password: str) -> str:
 
 
 def verify_password_safe(password: str, stored_hash: str) -> bool:
-    """Verify password against stored hash. If direct verify fails due to backend constraints,
-    retry by verifying a sha256 prehash (hex digest) of the password.
+    """Verify password against stored hash.
+    If it has more than 5 words, try verifying a sha256 prehash first, then direct.
+    Otherwise try direct first, then sha256 prehash as fallback.
     """
-    try:
-        if pwd_context.verify(password, stored_hash):
-            return True
-    except Exception:
-        # fall through to digest path
-        pass
-    # Try digest path
-    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
-    try:
-        return pwd_context.verify(digest, stored_hash)
-    except Exception:
-        return False
+    if is_passphrase(password):
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        try:
+            if pwd_context.verify(digest, stored_hash):
+                return True
+        except Exception:
+            pass
+        # Try direct just in case existing accounts were created without the rule
+        try:
+            return pwd_context.verify(password, stored_hash)
+        except Exception:
+            return False
+    else:
+        try:
+            if pwd_context.verify(password, stored_hash):
+                return True
+        except Exception:
+            pass
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        try:
+            return pwd_context.verify(digest, stored_hash)
+        except Exception:
+            return False
 
 
 @app.post("/register")
